@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import type { LoudnessSegment } from '../audio/loudness';
 import type { Chapter, Peaks } from '../types';
 import { clamp, formatTime } from '../utils/time';
 
@@ -7,6 +8,13 @@ const SNAP_PX = 10;
 const EDGE_PX = 6;
 const MIN_ZOOM = 2; // px per second
 const MAX_ZOOM = 800;
+/** mouse movement below which a press counts as a click (band preview) */
+const CLICK_PX = 4;
+
+const QUIET_FILL = 'rgba(240, 196, 25, 0.16)';
+const QUIET_STRIP = 'rgba(240, 196, 25, 0.9)';
+const LOUD_FILL = 'rgba(255, 107, 157, 0.18)';
+const LOUD_STRIP = 'rgba(255, 107, 157, 0.95)';
 
 interface WaveformProps {
   peaks: Peaks;
@@ -17,8 +25,12 @@ interface WaveformProps {
   follow: boolean;
   /** silence-split candidate boundaries (preview markers) */
   suggestions: number[];
+  /** continuous 过轻/过响 ranges to color on the waveform */
+  loudnessSegments: LoudnessSegment[];
   onZoom: (pxPerSec: number) => void;
   onSeek: (t: number) => void;
+  /** click an abnormal band: start previewing from that time */
+  onPreviewSegment: (t: number) => void;
   onSelect: (id: string | null) => void;
   onCreateFromDrag: (a: number, b: number, snap: number) => string | null;
   onMove: (id: string, start: number, snap: number) => void;
@@ -40,7 +52,8 @@ function niceStep(pxPerSec: number): number {
 }
 
 export function Waveform(props: WaveformProps) {
-  const { peaks, chapters, selectedId, playhead, pxPerSec, follow, suggestions } = props;
+  const { peaks, chapters, selectedId, playhead, pxPerSec, follow, suggestions, loudnessSegments } =
+    props;
   const scrollRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [viewportW, setViewportW] = useState(800);
@@ -112,11 +125,22 @@ export function Waveform(props: WaveformProps) {
     [chapters, pxPerSec],
   );
 
+  const hitBand = useCallback(
+    (t: number): LoudnessSegment | null => {
+      for (const s of loudnessSegments) {
+        if (t >= s.start && t < s.end) return s;
+      }
+      return null;
+    },
+    [loudnessSegments],
+  );
+
   // ---- mouse interactions ----
   const onMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
     const { t, x } = timeAtClientX(e.clientX);
     const hit = hitTest(t, x);
+    const band = hitBand(t);
     let next: DragState;
     if (hit) {
       props.onSelect(hit.chapter.id);
@@ -158,10 +182,19 @@ export function Waveform(props: WaveformProps) {
       dragRef.current = null;
       setDrag(null);
       if (!cur) return;
-      const { t: ct } = timeAtClientX(ev.clientX);
+      const { t: ct, x: cx } = timeAtClientX(ev.clientX);
+      const isClick = Math.abs(cx - x) <= CLICK_PX;
       if (cur.mode === 'maybe-create') {
-        propsRef.current.onSeek(ct);
-        propsRef.current.onSelect(null);
+        // click on an abnormal band -> preview from there; otherwise seek
+        if (isClick && (band || hitBand(ct))) {
+          propsRef.current.onPreviewSegment(ct);
+        } else {
+          propsRef.current.onSeek(ct);
+          propsRef.current.onSelect(null);
+        }
+      } else if (cur.mode === 'move' && isClick && (band || hitBand(ct))) {
+        // stationary click on a band inside a chapter -> preview from there
+        propsRef.current.onPreviewSegment(ct);
       } else if (cur.mode === 'create') {
         propsRef.current.onCreateFromDrag(cur.startT, ct, SNAP_PX / pxPerSec);
       }
@@ -176,11 +209,11 @@ export function Waveform(props: WaveformProps) {
     if (!canvas) return;
     const { t, x } = timeAtClientX(e.clientX);
     const hit = hitTest(t, x);
-    canvas.style.cursor = hit
-      ? hit.edge === 'body'
-        ? 'grab'
-        : 'ew-resize'
-      : 'crosshair';
+    if (hit) {
+      canvas.style.cursor = hit.edge === 'body' ? 'grab' : 'ew-resize';
+    } else {
+      canvas.style.cursor = hitBand(t) ? 'pointer' : 'crosshair';
+    }
   };
 
   const onWheel = (e: React.WheelEvent) => {
@@ -227,6 +260,19 @@ export function Waveform(props: WaveformProps) {
       const sel = c.id === selectedId;
       ctx.fillStyle = sel ? 'rgba(64, 160, 255, 0.28)' : 'rgba(64, 160, 255, 0.13)';
       ctx.fillRect(x0, waveTop, x1 - x0, waveH);
+    }
+
+    // loudness QC bands: continuous 过轻/过响 ranges, distinct colors
+    for (const seg of loudnessSegments) {
+      const x0 = seg.start * pxPerSec - scrollLeft;
+      const x1 = seg.end * pxPerSec - scrollLeft;
+      if (x1 < 0 || x0 > w) continue;
+      const isQuiet = seg.kind === 'quiet';
+      ctx.fillStyle = isQuiet ? QUIET_FILL : LOUD_FILL;
+      ctx.fillRect(x0, waveTop, x1 - x0, waveH);
+      // solid status strip along the bottom edge of the band
+      ctx.fillStyle = isQuiet ? QUIET_STRIP : LOUD_STRIP;
+      ctx.fillRect(x0, waveTop + waveH - 5, x1 - x0, 5);
     }
 
     // drag-create preview
@@ -361,7 +407,19 @@ export function Waveform(props: WaveformProps) {
       ctx.closePath();
       ctx.fill();
     }
-  }, [peaks, chapters, selectedId, playhead, pxPerSec, scrollLeft, viewportW, drag, duration, suggestions]);
+  }, [
+    peaks,
+    chapters,
+    selectedId,
+    playhead,
+    pxPerSec,
+    scrollLeft,
+    viewportW,
+    drag,
+    duration,
+    suggestions,
+    loudnessSegments,
+  ]);
 
   return (
     <div

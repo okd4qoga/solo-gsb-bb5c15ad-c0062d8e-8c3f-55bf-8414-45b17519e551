@@ -257,6 +257,88 @@ button.danger:hover:not(:disabled) {
   color: var(--muted);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.loudness-pill {
+  display: inline-block;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+  line-height: 1.6;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.loudness-ok {
+  color: #7ee787;
+  border-color: rgba(63, 185, 80, 0.5);
+  background: rgba(63, 185, 80, 0.12);
+}
+
+.loudness-quiet {
+  color: #f0c419;
+  border-color: rgba(240, 196, 25, 0.55);
+  background: rgba(240, 196, 25, 0.12);
+}
+
+.loudness-loud {
+  color: #ff6b9d;
+  border-color: rgba(255, 107, 157, 0.6);
+  background: rgba(255, 107, 157, 0.14);
+}
+
+.loudness-unknown {
+  color: var(--muted);
+}
+
+.loudness-legend {
+  display: flex;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.loudness-legend .dot {
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  border-radius: 2px;
+  margin-right: 4px;
+}
+
+.dot-quiet {
+  background: rgba(240, 196, 25, 0.9);
+}
+
+.dot-loud {
+  background: rgba(255, 107, 157, 0.95);
+}
+
+.qc-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #0d1117;
+  margin-bottom: 12px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.qc-detail.qc-quiet {
+  border-color: rgba(240, 196, 25, 0.5);
+}
+
+.qc-detail.qc-loud {
+  border-color: rgba(255, 107, 157, 0.6);
 }
 
 .chapter-actions {

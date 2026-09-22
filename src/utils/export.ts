@@ -1,4 +1,5 @@
 import type { Chapter } from '../types';
+import type { ChapterLoudness, LoudnessThresholds } from '../audio/loudness';
 import { formatVttTime } from './time';
 
 export function toWebVTT(chapters: Chapter[]): string {
@@ -10,17 +11,55 @@ export function toWebVTT(chapters: Chapter[]): string {
   return `WEBVTT\n\n${cues.join('\n\n')}\n`;
 }
 
-export function toJSON(chapters: Chapter[]): string {
+/** Finite dBFS rounded for export; -Infinity / NaN / null become JSON null. */
+function db(v: number | null): number | null {
+  return v !== null && Number.isFinite(v) ? Number(v.toFixed(1)) : null;
+}
+
+export interface JSONExportOptions {
+  loudness?: Map<string, ChapterLoudness> | null;
+  thresholds?: LoudnessThresholds | null;
+}
+
+export function toJSON(chapters: Chapter[], options: JSONExportOptions = {}): string {
   const sorted = [...chapters].sort((a, b) => a.start - b.start);
-  const data = sorted.map((c, i) => ({
-    id: c.id,
-    index: i + 1,
-    title: c.title.trim() || `Chapter ${i + 1}`,
-    start: Number(c.start.toFixed(3)),
-    end: Number(c.end.toFixed(3)),
-    duration: Number((c.end - c.start).toFixed(3)),
-  }));
-  return JSON.stringify({ version: 1, chapters: data }, null, 2);
+  const { loudness, thresholds } = options;
+  const data = sorted.map((c, i) => {
+    const base = {
+      id: c.id,
+      index: i + 1,
+      title: c.title.trim() || `Chapter ${i + 1}`,
+      start: Number(c.start.toFixed(3)),
+      end: Number(c.end.toFixed(3)),
+      duration: Number((c.end - c.start).toFixed(3)),
+    };
+    const q = loudness?.get(c.id);
+    if (!q) return base;
+    return {
+      ...base,
+      qualityControl: {
+        status: q.status,
+        meanDbfs: db(q.meanDbfs),
+        minDbfs: db(q.minDbfs),
+        maxDbfs: db(q.maxDbfs),
+        dynamicRangeDb: Number(q.rangeDb.toFixed(1)),
+        allSilent: q.allSilent,
+        silentCoverage: Number(q.silentCoverage.toFixed(3)),
+        quietSeconds: Number(q.quietCoverage.toFixed(3)),
+        loudSeconds: Number(q.loudCoverage.toFixed(3)),
+        analyzedSeconds: Number(q.analyzedDuration.toFixed(3)),
+      },
+    };
+  });
+  const qc =
+    loudness && thresholds
+      ? {
+          windowSeconds: 0.2,
+          quietThresholdDb: thresholds.quietDb,
+          loudThresholdDb: thresholds.loudDb,
+        }
+      : undefined;
+  return JSON.stringify({ version: 1, qualityControl: qc, chapters: data }, null, 2);
 }
 
 export function downloadFile(filename: string, content: string, mime: string): void {

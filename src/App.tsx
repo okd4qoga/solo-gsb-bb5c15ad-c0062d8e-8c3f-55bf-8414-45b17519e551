@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AudioEngine } from './audio/AudioEngine';
+import {
+  LOUDNESS_WINDOW_SEC,
+  computeDbfsWindows,
+  evaluateAllChapters,
+  findLoudnessSegments,
+  type LoudnessThresholds,
+} from './audio/loudness';
 import { computePeaks } from './audio/peaks';
 import {
   RMS_WINDOW_SEC,
@@ -10,10 +17,11 @@ import {
 } from './audio/silence';
 import { Waveform } from './components/Waveform';
 import { ChapterList } from './components/ChapterList';
+import { LoudnessPanel } from './components/LoudnessPanel';
 import { SilencePanel } from './components/SilencePanel';
 import { TransportBar } from './components/TransportBar';
 import { useChapters } from './hooks/useChapters';
-import type { Peaks } from './types';
+import type { Chapter, Peaks } from './types';
 import { downloadFile, toJSON, toWebVTT } from './utils/export';
 import { formatTime } from './utils/time';
 
@@ -41,6 +49,14 @@ export default function App() {
   const [minSilenceSec, setMinSilenceSec] = useState(0.5);
   const [showSuggestions, setShowSuggestions] = useState(true);
 
+  // chapter loudness QC (200ms dBFS windows computed once at import)
+  const [dbfsWindows, setDbfsWindows] = useState<Float32Array | null>(null);
+  const [loudnessThresholds, setLoudnessThresholds] = useState<LoudnessThresholds>({
+    quietDb: -30,
+    loudDb: -6,
+  });
+  const [showLoudness, setShowLoudness] = useState(true);
+
   const chaptersApi = useChapters(duration);
   const { chapters, selected, selectedId, reset: resetChapters } = chaptersApi;
 
@@ -62,6 +78,31 @@ export default function App() {
     const ranges = splitGapsAtBoundaries(chapters, suggestions, duration);
     chaptersApi.addMany(ranges);
   }, [chapters, suggestions, duration, chaptersApi]);
+
+  // Loudness QC: thresholds/chapters only re-run the classification over the
+  // cached 200ms dBFS windows — the decoded PCM is never scanned again.
+  const chapterLoudness = useMemo(() => {
+    if (!dbfsWindows) return null;
+    return evaluateAllChapters(
+      chapters,
+      dbfsWindows,
+      LOUDNESS_WINDOW_SEC,
+      duration,
+      loudnessThresholds,
+    );
+  }, [dbfsWindows, chapters, duration, loudnessThresholds]);
+
+  const loudnessSegments = useMemo(() => {
+    if (!dbfsWindows || !showLoudness) return [];
+    return findLoudnessSegments(dbfsWindows, LOUDNESS_WINDOW_SEC, duration, loudnessThresholds);
+  }, [dbfsWindows, showLoudness, duration, loudnessThresholds]);
+
+  const changeQuietThreshold = useCallback((v: number) => {
+    setLoudnessThresholds((t) => ({ ...t, quietDb: Math.min(v, t.loudDb - 1) }));
+  }, []);
+  const changeLoudThreshold = useCallback((v: number) => {
+    setLoudnessThresholds((t) => ({ ...t, loudDb: Math.max(v, t.quietDb + 1) }));
+  }, []);
 
   // playback clock
   useEffect(() => {
@@ -89,6 +130,8 @@ export default function App() {
         setPeaks(computePeaks(buffer));
         // reuse the decoded buffer for silence analysis (no re-decode)
         setRmsWindows(computeRmsWindows(buffer));
+        // reuse the same decoded PCM once more for 200ms loudness windows
+        setDbfsWindows(computeDbfsWindows(buffer));
         setDuration(buffer.duration);
         setFileName(file.name);
         setPlayhead(0);
@@ -154,6 +197,27 @@ export default function App() {
   const previewSelection = useCallback(() => {
     if (selected) previewChapter(selected.start, selected.end);
   }, [selected, previewChapter]);
+
+  /** Preview starting at a point (clicking an abnormal band). */
+  const previewFrom = useCallback(
+    (t: number) => {
+      if (!engine.hasBuffer) return;
+      engine.play(t);
+      setPlayhead(t);
+      setPlaying(true);
+    },
+    [engine],
+  );
+
+  /** From the list status pill: preview the chapter from its first issue. */
+  const previewChapterIssue = useCallback(
+    (c: Chapter) => {
+      if (!engine.hasBuffer) return;
+      const q = chapterLoudness?.get(c.id);
+      previewChapter(q?.firstIssueAt ?? c.start, c.end);
+    },
+    [engine, chapterLoudness, previewChapter],
+  );
 
   const addAtPlayhead = useCallback(() => {
     chaptersApi.createAtPlayhead(playhead);
@@ -225,7 +289,13 @@ export default function App() {
         </button>
         <button
           disabled={chapters.length === 0}
-          onClick={() => downloadFile(`${baseName}.chapters.json`, toJSON(chapters), 'application/json')}
+          onClick={() =>
+            downloadFile(
+              `${baseName}.chapters.json`,
+              toJSON(chapters, { loudness: chapterLoudness, thresholds: loudnessThresholds }),
+              'application/json',
+            )
+          }
         >
           导出 JSON
         </button>
@@ -261,8 +331,10 @@ export default function App() {
             pxPerSec={pxPerSec}
             follow={follow && playing}
             suggestions={showSuggestions ? suggestions : []}
+            loudnessSegments={loudnessSegments}
             onZoom={setPxPerSec}
             onSeek={seek}
+            onPreviewSegment={previewFrom}
             onSelect={chaptersApi.select}
             onCreateFromDrag={chaptersApi.createFromDrag}
             onMove={chaptersApi.move}
@@ -272,12 +344,14 @@ export default function App() {
             <ChapterList
               chapters={chapters}
               selectedId={selectedId}
+              loudness={chapterLoudness}
               onSelect={(id) => {
                 chaptersApi.select(id);
                 const c = chapters.find((x) => x.id === id);
                 if (c) seek(c.start);
               }}
               onPreview={(c) => previewChapter(c.start, c.end)}
+              onPreviewIssue={previewChapterIssue}
               onRename={chaptersApi.rename}
               onRemove={chaptersApi.remove}
             />
@@ -291,6 +365,15 @@ export default function App() {
                 onMinSilenceSecChange={setMinSilenceSec}
                 onToggleShow={() => setShowSuggestions((s) => !s)}
                 onApplyAll={applyAllSuggestions}
+              />
+              <LoudnessPanel
+                thresholds={loudnessThresholds}
+                show={showLoudness}
+                available={dbfsWindows !== null}
+                statuses={chapters.map((c) => chapterLoudness?.get(c.id)?.status ?? 'unknown')}
+                onQuietDbChange={changeQuietThreshold}
+                onLoudDbChange={changeLoudThreshold}
+                onToggleShow={() => setShowLoudness((s) => !s)}
               />
               {selected ? (
                 <>
@@ -307,6 +390,40 @@ export default function App() {
                     <span>结束 {formatTime(selected.end)}</span>
                     <span>时长 {(selected.end - selected.start).toFixed(2)}s</span>
                   </div>
+                  {(() => {
+                    const q = chapterLoudness?.get(selected.id);
+                    if (!q) return null;
+                    const mean = q.meanDbfs === null ? '-∞' : `${q.meanDbfs.toFixed(1)} dBFS`;
+                    return (
+                      <div className={`qc-detail qc-${q.status}`}>
+                        <span>
+                          质检状态：
+                          {q.status === 'ok'
+                            ? '正常'
+                            : q.status === 'quiet'
+                              ? '过轻'
+                              : q.status === 'loud'
+                                ? '过响'
+                                : '区间过短'}
+                          {q.allSilent ? '（全静音）' : ''}
+                        </span>
+                        <span>
+                          平均 {mean} · 动态范围 {q.rangeDb.toFixed(1)} dB
+                          {q.minDbfs !== null && q.maxDbfs !== null
+                            ? `（${q.minDbfs.toFixed(1)} ~ ${q.maxDbfs.toFixed(1)} dBFS）`
+                            : ''}
+                        </span>
+                        {(q.quietCoverage > 0 || q.loudCoverage > 0) && (
+                          <button
+                            onClick={() => previewChapterIssue(selected)}
+                            title="从首个异常窗口开始播放"
+                          >
+                            ⚠ 从异常处预览
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })()}
                   <button className="primary" onClick={previewSelection}>
                     ▶ 预览该章节
                   </button>
