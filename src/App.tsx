@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AudioEngine } from './audio/AudioEngine';
+import {
+  LOUDNESS_WINDOW_SEC,
+  analyzeChaptersLoudness,
+  computeLoudnessWindows,
+  findLoudnessAnomalies,
+} from './audio/loudness';
+import type { ChapterLoudness, LoudnessWindows } from './audio/loudness';
 import { computePeaks } from './audio/peaks';
 import {
   RMS_WINDOW_SEC,
@@ -10,15 +17,18 @@ import {
 } from './audio/silence';
 import { Waveform } from './components/Waveform';
 import { ChapterList } from './components/ChapterList';
+import { LoudnessPanel } from './components/LoudnessPanel';
 import { SilencePanel } from './components/SilencePanel';
 import { TransportBar } from './components/TransportBar';
 import { useChapters } from './hooks/useChapters';
-import type { Peaks } from './types';
+import type { Chapter, ChapterQualityMetrics, Peaks } from './types';
 import { downloadFile, toJSON, toWebVTT } from './utils/export';
 import { formatTime } from './utils/time';
 
 const NUDGE_FINE = 0.05;
 const NUDGE_COARSE = 1;
+/** preview length when starting playback from an anomaly band */
+const ANOMALY_PREVIEW_SEC = 5;
 
 export default function App() {
   const engineRef = useRef<AudioEngine | null>(null);
@@ -41,6 +51,12 @@ export default function App() {
   const [minSilenceSec, setMinSilenceSec] = useState(0.5);
   const [showSuggestions, setShowSuggestions] = useState(true);
 
+  // loudness consistency QC (200ms peak-dBFS windows, computed once at import)
+  const [loudnessWindows, setLoudnessWindows] = useState<LoudnessWindows | null>(null);
+  const [quietThresholdDb, setQuietThresholdDb] = useState(-45);
+  const [loudThresholdDb, setLoudThresholdDb] = useState(-3);
+  const [showLoudness, setShowLoudness] = useState(true);
+
   const chaptersApi = useChapters(duration);
   const { chapters, selected, selectedId, reset: resetChapters } = chaptersApi;
 
@@ -62,6 +78,40 @@ export default function App() {
     const ranges = splitGapsAtBoundaries(chapters, suggestions, duration);
     chaptersApi.addMany(ranges);
   }, [chapters, suggestions, duration, chaptersApi]);
+
+  // QC classification only: threshold changes never touch the decoded PCM
+  const chapterQuality = useMemo(() => {
+    if (!loudnessWindows) return new Map<string, ChapterLoudness>();
+    return analyzeChaptersLoudness(
+      loudnessWindows,
+      chapters,
+      quietThresholdDb,
+      loudThresholdDb,
+    );
+  }, [loudnessWindows, chapters, quietThresholdDb, loudThresholdDb]);
+
+  // continuous anomaly bands for the whole file (waveform overlay)
+  const loudnessAnomalies = useMemo(() => {
+    if (!loudnessWindows) return [];
+    return findLoudnessAnomalies(loudnessWindows, quietThresholdDb, loudThresholdDb);
+  }, [loudnessWindows, quietThresholdDb, loudThresholdDb]);
+
+  const flaggedCount = useMemo(() => {
+    let n = 0;
+    for (const q of chapterQuality.values()) {
+      if (q.status !== 'ok') n++;
+    }
+    return n;
+  }, [chapterQuality]);
+
+  const changeQuietThreshold = useCallback(
+    (v: number) => setQuietThresholdDb(Math.min(v, loudThresholdDb)),
+    [loudThresholdDb],
+  );
+  const changeLoudThreshold = useCallback(
+    (v: number) => setLoudThresholdDb(Math.max(v, quietThresholdDb)),
+    [quietThresholdDb],
+  );
 
   // playback clock
   useEffect(() => {
@@ -89,6 +139,8 @@ export default function App() {
         setPeaks(computePeaks(buffer));
         // reuse the decoded buffer for silence analysis (no re-decode)
         setRmsWindows(computeRmsWindows(buffer));
+        // and for the 200ms loudness QC windows (also single pass)
+        setLoudnessWindows(computeLoudnessWindows(buffer));
         setDuration(buffer.duration);
         setFileName(file.name);
         setPlayhead(0);
@@ -155,6 +207,36 @@ export default function App() {
     if (selected) previewChapter(selected.start, selected.end);
   }, [selected, previewChapter]);
 
+  /** Preview from an arbitrary point inside a chapter (QC anomaly jump). */
+  const previewChapterAt = useCallback(
+    (c: Chapter, t: number) => {
+      if (!engine.hasBuffer) return;
+      const at = Math.max(c.start, Math.min(t, c.end));
+      previewChapter(at, c.end);
+    },
+    [engine, previewChapter],
+  );
+
+  const previewAnomaly = useCallback(
+    (start: number) => {
+      if (!engine.hasBuffer || duration <= 0) return;
+      chaptersApi.select(null);
+      // select the chapter covering the anomaly so the list highlights it
+      const owner = [...chapters]
+        .sort((a, b) => a.start - b.start)
+        .find((c) => start >= c.start && start < c.end);
+      if (owner) chaptersApi.select(owner.id);
+      // stop at the owning chapter end, else after a short fixed preview
+      const stopAt = owner
+        ? owner.end
+        : Math.min(duration, start + ANOMALY_PREVIEW_SEC);
+      engine.play(start, stopAt);
+      setPlayhead(start);
+      setPlaying(true);
+    },
+    [engine, duration, chapters, chaptersApi],
+  );
+
   const addAtPlayhead = useCallback(() => {
     chaptersApi.createAtPlayhead(playhead);
   }, [chaptersApi, playhead]);
@@ -207,6 +289,36 @@ export default function App() {
 
   const baseName = (fileName ?? 'podcast').replace(/\.[^.]+$/, '');
 
+  // QC metrics for JSON export (finite values only; null for silent chapters)
+  const qualityForExport = useMemo(() => {
+    const map = new Map<string, ChapterQualityMetrics>();
+    for (const [id, q] of chapterQuality) {
+      map.set(id, {
+        loudnessStatus: q.status,
+        meanDbfs: q.meanDbfs,
+        dynamicRangeDb: q.rangeDb,
+        quietDuration: q.quietDuration,
+        loudDuration: q.loudDuration,
+      });
+    }
+    return map;
+  }, [chapterQuality]);
+
+  const exportJSON = useCallback(() => {
+    downloadFile(
+      `${baseName}.chapters.json`,
+      toJSON(chapters, qualityForExport, {
+        windowSec: LOUDNESS_WINDOW_SEC,
+        quietThresholdDbfs: quietThresholdDb,
+        loudThresholdDbfs: loudThresholdDb,
+      }),
+      'application/json',
+    );
+  }, [baseName, chapters, qualityForExport, quietThresholdDb, loudThresholdDb]);
+
+  const selectedQuality = selected ? chapterQuality.get(selected.id) ?? null : null;
+  const STATUS_TEXT = { ok: '正常', quiet: '过轻', loud: '过响', silent: '全静音' } as const;
+
   return (
     <div className="app" onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
       <header className="app-header">
@@ -225,7 +337,7 @@ export default function App() {
         </button>
         <button
           disabled={chapters.length === 0}
-          onClick={() => downloadFile(`${baseName}.chapters.json`, toJSON(chapters), 'application/json')}
+          onClick={exportJSON}
         >
           导出 JSON
         </button>
@@ -261,8 +373,10 @@ export default function App() {
             pxPerSec={pxPerSec}
             follow={follow && playing}
             suggestions={showSuggestions ? suggestions : []}
+            anomalies={showLoudness ? loudnessAnomalies : []}
             onZoom={setPxPerSec}
             onSeek={seek}
+            onPreviewAnomaly={previewAnomaly}
             onSelect={chaptersApi.select}
             onCreateFromDrag={chaptersApi.createFromDrag}
             onMove={chaptersApi.move}
@@ -272,12 +386,14 @@ export default function App() {
             <ChapterList
               chapters={chapters}
               selectedId={selectedId}
+              qualityById={chapterQuality}
               onSelect={(id) => {
                 chaptersApi.select(id);
                 const c = chapters.find((x) => x.id === id);
                 if (c) seek(c.start);
               }}
               onPreview={(c) => previewChapter(c.start, c.end)}
+              onPreviewAt={previewChapterAt}
               onRename={chaptersApi.rename}
               onRemove={chaptersApi.remove}
             />
@@ -291,6 +407,16 @@ export default function App() {
                 onMinSilenceSecChange={setMinSilenceSec}
                 onToggleShow={() => setShowSuggestions((s) => !s)}
                 onApplyAll={applyAllSuggestions}
+              />
+              <LoudnessPanel
+                quietThresholdDb={quietThresholdDb}
+                loudThresholdDb={loudThresholdDb}
+                show={showLoudness}
+                flaggedCount={flaggedCount}
+                chapterCount={chapters.length}
+                onQuietThresholdDbChange={changeQuietThreshold}
+                onLoudThresholdDbChange={changeLoudThreshold}
+                onToggleShow={() => setShowLoudness((s) => !s)}
               />
               {selected ? (
                 <>
@@ -307,6 +433,34 @@ export default function App() {
                     <span>结束 {formatTime(selected.end)}</span>
                     <span>时长 {(selected.end - selected.start).toFixed(2)}s</span>
                   </div>
+                  {selectedQuality && (
+                    <div className="qc-detail">
+                      <h3>音量质检</h3>
+                      <span className={`qc-badge qc-${selectedQuality.status}`}>
+                        {STATUS_TEXT[selectedQuality.status]}
+                      </span>
+                      <div className="detail-times">
+                        <span>
+                          平均{' '}
+                          {selectedQuality.meanDbfs === null
+                            ? '—'
+                            : `${selectedQuality.meanDbfs.toFixed(1)} dBFS`}
+                        </span>
+                        <span>动态范围 {selectedQuality.rangeDb.toFixed(1)} dB</span>
+                        <span>过轻时长 {selectedQuality.quietDuration.toFixed(2)}s</span>
+                        <span>过响时长 {selectedQuality.loudDuration.toFixed(2)}s</span>
+                      </div>
+                      {selectedQuality.firstAnomalyStart !== null && (
+                        <button
+                          onClick={() =>
+                            previewChapterAt(selected, selectedQuality.firstAnomalyStart ?? selected.start)
+                          }
+                        >
+                          ⚠ 从首个异常处预览（{formatTime(selectedQuality.firstAnomalyStart)}）
+                        </button>
+                      )}
+                    </div>
+                  )}
                   <button className="primary" onClick={previewSelection}>
                     ▶ 预览该章节
                   </button>

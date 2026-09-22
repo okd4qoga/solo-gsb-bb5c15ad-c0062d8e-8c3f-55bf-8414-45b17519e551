@@ -23,3 +23,12 @@ export interface Peaks {
   rate: number;
   duration: number;
 }
+
+/** Per-chapter QC metrics attached to JSON export. */
+export interface ChapterQualityMetrics {
+  loudnessStatus: 'ok' | 'quiet' | 'loud' | 'silent';
+  meanDbfs: number | null;
+  dynamicRangeDb: number;
+  quietDuration: number;
+  loudDuration: number;
+}

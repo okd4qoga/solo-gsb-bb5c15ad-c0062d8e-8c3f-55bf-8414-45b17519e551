@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { Chapter, Peaks } from '../types';
+import type { LoudnessRange } from '../audio/loudness';
 import { clamp, formatTime } from '../utils/time';
 
 const RULER_H = 24;
@@ -17,8 +18,12 @@ interface WaveformProps {
   follow: boolean;
   /** silence-split candidate boundaries (preview markers) */
   suggestions: number[];
+  /** loudness QC anomaly bands, already sorted by start time */
+  anomalies: LoudnessRange[];
   onZoom: (pxPerSec: number) => void;
   onSeek: (t: number) => void;
+  /** click on an anomaly band seeks there and previews the first ~5s */
+  onPreviewAnomaly: (start: number) => void;
   onSelect: (id: string | null) => void;
   onCreateFromDrag: (a: number, b: number, snap: number) => string | null;
   onMove: (id: string, start: number, snap: number) => void;
@@ -40,7 +45,7 @@ function niceStep(pxPerSec: number): number {
 }
 
 export function Waveform(props: WaveformProps) {
-  const { peaks, chapters, selectedId, playhead, pxPerSec, follow, suggestions } = props;
+  const { peaks, chapters, selectedId, playhead, pxPerSec, follow, suggestions, anomalies } = props;
   const scrollRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [viewportW, setViewportW] = useState(800);
@@ -112,6 +117,18 @@ export function Waveform(props: WaveformProps) {
     [chapters, pxPerSec],
   );
 
+  // anomaly band under the time cursor (segments are sorted and typically few)
+  const anomalyAt = useCallback(
+    (t: number): LoudnessRange | null => {
+      for (const a of anomalies) {
+        if (t < a.start) break;
+        if (t < a.end) return a;
+      }
+      return null;
+    },
+    [anomalies],
+  );
+
   // ---- mouse interactions ----
   const onMouseDown = (e: React.MouseEvent) => {
     if (e.button !== 0) return;
@@ -160,8 +177,14 @@ export function Waveform(props: WaveformProps) {
       if (!cur) return;
       const { t: ct } = timeAtClientX(ev.clientX);
       if (cur.mode === 'maybe-create') {
-        propsRef.current.onSeek(ct);
-        propsRef.current.onSelect(null);
+        // a plain click (no drag) on an anomaly band previews from there
+        const hitAnomaly = anomalyAt(cur.startT);
+        if (hitAnomaly) {
+          propsRef.current.onPreviewAnomaly(hitAnomaly.start);
+        } else {
+          propsRef.current.onSeek(ct);
+          propsRef.current.onSelect(null);
+        }
       } else if (cur.mode === 'create') {
         propsRef.current.onCreateFromDrag(cur.startT, ct, SNAP_PX / pxPerSec);
       }
@@ -180,7 +203,9 @@ export function Waveform(props: WaveformProps) {
       ? hit.edge === 'body'
         ? 'grab'
         : 'ew-resize'
-      : 'crosshair';
+      : anomalyAt(t)
+        ? 'pointer'
+        : 'crosshair';
   };
 
   const onWheel = (e: React.WheelEvent) => {
@@ -227,6 +252,22 @@ export function Waveform(props: WaveformProps) {
       const sel = c.id === selectedId;
       ctx.fillStyle = sel ? 'rgba(64, 160, 255, 0.28)' : 'rgba(64, 160, 255, 0.13)';
       ctx.fillRect(x0, waveTop, x1 - x0, waveH);
+    }
+
+    // loudness QC anomaly bands: purple = too quiet, red = too loud
+    for (const a of anomalies) {
+      const x0 = a.start * pxPerSec - scrollLeft;
+      const x1 = a.end * pxPerSec - scrollLeft;
+      if (x1 < 0 || x0 > w) continue;
+      if (a.kind === 'loud') {
+        ctx.fillStyle = 'rgba(255, 86, 86, 0.30)';
+      } else {
+        ctx.fillStyle = 'rgba(168, 110, 255, 0.30)';
+      }
+      ctx.fillRect(x0, waveTop, x1 - x0, waveH);
+      // marker edge strips make narrow / single-window anomalies visible
+      ctx.fillStyle = a.kind === 'loud' ? 'rgba(255, 120, 120, 0.85)' : 'rgba(190, 150, 255, 0.85)';
+      ctx.fillRect(x0, waveTop, Math.min(2, Math.max(1, x1 - x0)), waveH);
     }
 
     // drag-create preview
@@ -292,6 +333,20 @@ export function Waveform(props: WaveformProps) {
       if (x1 - x0 > tw + 12) {
         ctx.fillStyle = sel ? '#dceeff' : 'rgba(220, 238, 255, 0.75)';
         ctx.fillText(label, x0 + 6, waveTop + 16);
+      }
+    }
+
+    // loudness anomaly labels along the bottom edge of wide enough bands
+    ctx.font = '11px system-ui, sans-serif';
+    for (const a of anomalies) {
+      const x0 = a.start * pxPerSec - scrollLeft;
+      const x1 = a.end * pxPerSec - scrollLeft;
+      if (x1 < 0 || x0 > w) continue;
+      const label = a.kind === 'loud' ? '过响' : '过轻';
+      const tw = ctx.measureText(label).width;
+      if (x1 - x0 > tw + 10) {
+        ctx.fillStyle = a.kind === 'loud' ? 'rgba(255, 205, 205, 0.9)' : 'rgba(228, 214, 255, 0.9)';
+        ctx.fillText(label, x0 + 5, waveTop + waveH - 6);
       }
     }
 
@@ -361,7 +416,7 @@ export function Waveform(props: WaveformProps) {
       ctx.closePath();
       ctx.fill();
     }
-  }, [peaks, chapters, selectedId, playhead, pxPerSec, scrollLeft, viewportW, drag, duration, suggestions]);
+  }, [peaks, chapters, selectedId, playhead, pxPerSec, scrollLeft, viewportW, drag, duration, suggestions, anomalies]);
 
   return (
     <div
